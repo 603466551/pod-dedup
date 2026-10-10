@@ -1,0 +1,34 @@
+[project]
+name = "pod-dedup-backend"
+version = "0.1.0"
+description = "POD 图片去重与归档管理系统后端"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.14,<1.15",
+  "fastapi>=0.115,<0.116",
+  "faiss-cpu>=1.15,<1.16",
+  "numpy>=2.2,<3",
+  "opencv-python-headless>=4.11,<5",
+  "pillow>=11.0,<12",
+  "pydantic-settings>=2.6,<3",
+  "pymysql>=1.1,<2",
+  "sqlalchemy>=2.0,<2.1",
+  "torch>=2.7,<2.8",
+  "tzdata>=2025.1,<2027",
+  "uvicorn[standard]>=0.32,<0.33",
+]
+
+[dependency-groups]
+dev = [
+  "httpx>=0.27,<0.29",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
