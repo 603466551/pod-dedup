@@ -28,6 +28,22 @@ from app.services.ratios import normalize_ratio
 router = APIRouter(prefix="/tasks", tags=["tasks"])
 
 IN_PROGRESS_ITEM_STATUSES = {"PENDING", "FROZEN", "CHECKING", "MOVING"}
+ARCHIVE_PROGRESS_STATUSES = {"READY_TO_ARCHIVE", "ARCHIVED"}
+
+
+def archive_progress(items: list[TaskItem]) -> dict[str, int] | None:
+    """Return the unified POD archive checkpoint without changing task state."""
+    archive_items = [
+        item for item in items
+        if item.status in ARCHIVE_PROGRESS_STATUSES or item.error_code == "ARCHIVE_FAILED"
+    ]
+    if not archive_items:
+        return None
+    return {
+        "completed": sum(item.status == "ARCHIVED" for item in archive_items),
+        "total": len(archive_items),
+        "failed": sum(item.error_code == "ARCHIVE_FAILED" for item in archive_items),
+    }
 
 
 def task_response(task) -> TaskResponse:
@@ -166,13 +182,17 @@ def get_task_progress(task_id: int, session: Session = Depends(get_session)):
     events = list(session.scalars(select(TaskEvent).where(TaskEvent.task_id == task_id).order_by(TaskEvent.id.desc()).limit(100)))
     status_counts = Counter(item.status for item in items)
     processed_count = sum(item.status not in IN_PROGRESS_ITEM_STATUSES for item in items)
+    archive = archive_progress(items)
+    summary = {
+        "total": len(items),
+        "processed": processed_count,
+        "status_counts": dict(status_counts),
+    }
+    if archive is not None:
+        summary["archive"] = archive
     return {
         "task": task_response(task).model_dump(),
-        "summary": {
-            "total": len(items),
-            "processed": processed_count,
-            "status_counts": dict(status_counts),
-        },
+        "summary": summary,
         "items": [
             {
                 "id": str(item.id), "filename": item.observed_path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1],
