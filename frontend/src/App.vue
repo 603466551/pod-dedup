@@ -16,6 +16,7 @@ type TaskEvent = { id: string; level: string; stage: string; message: string; cr
 type VlmCall = { id: string; task_id: string; provider: string; model: string; status: string; error_code?: string | null };
 
 const reviewGroups = ref<ReviewGroup[]>([]);
+const reviewSearchQuery = ref("");
 const selectedTask = ref<Task | null>(null);
 const taskItems = ref<TaskItem[]>([]);
 const showAllTaskItems = ref(false);
@@ -25,6 +26,7 @@ const operations = ref<Operation[]>([]);
 const duplicateRecords = ref<DuplicateRecord[]>([]);
 const vlmCalls = ref<VlmCall[]>([]);
 const health = ref<Record<string, any>>({});
+const healthError = ref<string | null>(null);
 const runtimeLogs = ref<string[]>([]);
 const activePrimary = ref<"workspace" | "tasks" | "system">("workspace");
 const activeSection = ref("dedup");
@@ -38,6 +40,9 @@ type DirectoryField = "sourceBatch" | "sourceLibrary" | "podPending" | "podLibra
 const choosingDirectory = ref<DirectoryField | null>(null);
 const lockedDirectories = reactive({ sourceLibrary: false, podLibrary: false });
 const settingsForm = reactive({ retrievalTopK: 20, retrievalMinSimilarity: 0.85, appTimezone: "Asia/Shanghai", ratioTolerance: 0.02, sourceVisualRuleValidated: false, sourceVisualAutoDelete: false, vlmEnabled: false, vlmBaseUrl: "", vlmModel: "", vlmApiKey: "", vlmMaxCalls: 100 });
+const settingsLoaded = ref(false);
+const settingsHasUnsavedChanges = ref(false);
+const applyingSettings = ref(false);
 const directoryLabels: Record<DirectoryField, string> = { sourceBatch: "本次来源文件夹", sourceLibrary: "历史源图库", podPending: "POD待处理目录", podLibrary: "历史POD图库" };
 const formStorageKey = "pod-dedup.workflow-inputs.v1";
 const productionRatios = ref<string[]>(["1x1", "3x4", "4x3", "9x16", "16x9"]);
@@ -46,8 +51,21 @@ const visibleTaskItems = computed(() => showAllTaskItems.value ? taskItems.value
 
 function idempotencyKey(): string { return crypto.randomUUID(); }
 function formatTime(value?: string | null): string { return value ? value.replace("T", " ").slice(0, 19) : "—"; }
+function requestErrorMessage(error: unknown): string {
+  if (axios.isAxiosError(error)) {
+    return error.response ? `HTTP ${error.response.status}，健康检查接口不可用` : "无法连接到 API 服务";
+  }
+  return "健康检查失败";
+}
 function selectSection(primary: "workspace" | "tasks" | "system", section: string): void { activePrimary.value = primary; activeSection.value = section; }
 const pendingReviewCount = computed(() => reviewGroups.value.reduce((total, group) => total + group.relations.length, 0));
+const filteredReviewGroups = computed(() => {
+  const query = reviewSearchQuery.value.trim().toLowerCase();
+  if (!query) return reviewGroups.value;
+  return reviewGroups.value.filter((group) =>
+    group.task_id.includes(query) || group.images.some((image) => image.filename.toLowerCase().includes(query)),
+  );
+});
 function relationScore(relation: ReviewRelation): string { return String(relation.evidence?.cosine_similarity ?? "—"); }
 function relationVlmStatus(relation: ReviewRelation): string { return String(relation.evidence?.vlm_status ?? "未调用或已返回结构化结果"); }
 function imageLabel(group: ReviewGroup, imageId: string): string { return group.images.find((image) => image.id === imageId)?.filename ?? "图片记录缺失"; }
@@ -84,6 +102,9 @@ function restoreForm(): void {
   } catch { /* Invalid browser preferences must never block the application. */ }
 }
 watch(form, (value) => localStorage.setItem(formStorageKey, JSON.stringify(value)), { deep: true });
+watch(settingsForm, () => {
+  if (settingsLoaded.value && !applyingSettings.value) settingsHasUnsavedChanges.value = true;
+}, { deep: true, flush: "sync" });
 
 async function chooseDirectory(field: DirectoryField): Promise<void> {
   if ((field === "sourceLibrary" || field === "podLibrary") && lockedDirectories[field]) {
@@ -101,6 +122,14 @@ async function chooseDirectory(field: DirectoryField): Promise<void> {
 
 async function refresh(): Promise<void> {
   try {
+    health.value = (await axios.get("/api/v1/health")).data;
+    healthError.value = null;
+  } catch (error: unknown) {
+    health.value = {};
+    healthError.value = requestErrorMessage(error);
+    return;
+  }
+  try {
     tasks.value = await listTasks();
     const pendingGroups = (await axios.get("/api/v1/reviews/groups")).data.items as ReviewGroup[];
     reviewGroups.value = pendingGroups;
@@ -108,16 +137,21 @@ async function refresh(): Promise<void> {
       if (!groupKeepIds[group.id]) groupKeepIds[group.id] = group.images.map((image) => image.id);
     }
     const { data: systemSettings } = await axios.get("/api/v1/settings");
-    settingsForm.retrievalTopK = systemSettings.retrieval_top_k;
-    settingsForm.retrievalMinSimilarity = systemSettings.retrieval_candidate_min_similarity;
-    settingsForm.sourceVisualRuleValidated = systemSettings.source_visual_rule_validated;
-    settingsForm.sourceVisualAutoDelete = systemSettings.source_visual_auto_delete;
-    settingsForm.appTimezone = systemSettings.app_timezone;
-    settingsForm.ratioTolerance = systemSettings.ratio_rel_tolerance;
-    settingsForm.vlmEnabled = systemSettings.vlm_enabled;
-    settingsForm.vlmBaseUrl = systemSettings.vlm_base_url ?? "";
-    settingsForm.vlmModel = systemSettings.vlm_model ?? "";
-    settingsForm.vlmMaxCalls = systemSettings.vlm_max_calls_per_task;
+    if (!settingsLoaded.value || !settingsHasUnsavedChanges.value) {
+      applyingSettings.value = true;
+      settingsForm.retrievalTopK = systemSettings.retrieval_top_k;
+      settingsForm.retrievalMinSimilarity = systemSettings.retrieval_candidate_min_similarity;
+      settingsForm.sourceVisualRuleValidated = systemSettings.source_visual_rule_validated;
+      settingsForm.sourceVisualAutoDelete = systemSettings.source_visual_auto_delete;
+      settingsForm.appTimezone = systemSettings.app_timezone;
+      settingsForm.ratioTolerance = systemSettings.ratio_rel_tolerance;
+      settingsForm.vlmEnabled = systemSettings.vlm_enabled;
+      settingsForm.vlmBaseUrl = systemSettings.vlm_base_url ?? "";
+      settingsForm.vlmModel = systemSettings.vlm_model ?? "";
+      settingsForm.vlmMaxCalls = systemSettings.vlm_max_calls_per_task;
+      applyingSettings.value = false;
+      settingsLoaded.value = true;
+    }
     productionRatios.value = systemSettings.production_ratio_codes ?? productionRatios.value;
     lockedDirectories.sourceLibrary = Boolean(systemSettings.source_library_locked);
     lockedDirectories.podLibrary = Boolean(systemSettings.pod_library_locked);
@@ -127,7 +161,6 @@ async function refresh(): Promise<void> {
     operations.value = (await axios.get("/api/v1/operations")).data.items as Operation[];
     duplicateRecords.value = (await axios.get("/api/v1/duplicate-records")).data.items as DuplicateRecord[];
     vlmCalls.value = (await axios.get("/api/v1/logs/vlm-calls")).data.items as VlmCall[];
-    health.value = (await axios.get("/api/v1/health")).data;
     runtimeLogs.value = (await axios.get("/api/v1/logs/runtime?lines=100")).data.items as string[];
     if (selectedTask.value) await loadTaskProgress(selectedTask.value.task_id, false);
   } catch { /* The health view itself will reveal unavailable services. */ }
@@ -141,7 +174,10 @@ async function saveSettings(): Promise<void> {
     if (form.podPending) payload.pod_pending_dir = form.podPending;
     if (settingsForm.vlmApiKey) payload.vlm_api_key = settingsForm.vlmApiKey;
     await axios.put("/api/v1/settings", payload);
+    applyingSettings.value = true;
     settingsForm.vlmApiKey = "";
+    applyingSettings.value = false;
+    settingsHasUnsavedChanges.value = false;
     ElMessage.success("设置已保存，仅影响新任务");
     await refresh();
   } catch (error: any) { ElMessage.error(error?.response?.data?.detail?.message ?? "设置保存失败"); }
@@ -256,7 +292,7 @@ onUnmounted(() => { if (refreshTimer) window.clearInterval(refreshTimer); });
         <el-button text :class="{ active: activePrimary === 'tasks' }" @click="selectSection('tasks', 'task-list')">任务与审核</el-button>
         <el-button text :class="{ active: activePrimary === 'system' }" @click="selectSection('system', 'health')">系统</el-button>
       </nav>
-      <div class="top-status"><el-tag size="small" :type="health.database === 'ready' ? 'success' : 'warning'">MySQL {{ health.database ?? '检测中' }}</el-tag><el-tag size="small" :type="health.worker === 'READY' ? 'success' : 'warning'">Worker {{ health.worker ?? '检测中' }}</el-tag></div>
+      <div class="top-status"><el-tag v-if="healthError" size="small" type="danger">API 不可达</el-tag><el-tag size="small" :type="health.database === 'ready' ? 'success' : 'warning'">MySQL {{ healthError ? '不可用' : health.database ?? '检测中' }}</el-tag><el-tag size="small" :type="health.worker === 'READY' ? 'success' : 'warning'">Worker {{ healthError ? '不可用' : health.worker ?? '检测中' }}</el-tag></div>
     </el-header>
     <el-container>
       <el-aside width="208px" class="side-nav">
@@ -281,11 +317,41 @@ onUnmounted(() => { if (refreshTimer) window.clearInterval(refreshTimer); });
 
         <section v-if="activeSection === 'current-task'"><div class="page-heading"><div><h1>当前任务进度</h1><p>自动刷新；上方汇总统计与下方最近更新记录分别展示，不按同一顺序逐行对应。</p></div><div class="actions"><el-button v-if="selectedTask && taskCanBeCancelled(selectedTask)" type="danger" :loading="cancellingTaskIds[selectedTask.task_id]" @click="cancelTask(selectedTask)">取消任务</el-button><el-button @click="selectedTask && loadTaskProgress(selectedTask.task_id, true)">刷新当前任务</el-button></div></div><el-empty v-if="!selectedTask" description="请先在任务中心选择一个任务" /><template v-else><el-card class="panel"><el-descriptions :column="3" border><el-descriptions-item label="任务">#{{ selectedTask.task_id }} · {{ selectedTask.type }}</el-descriptions-item><el-descriptions-item label="状态">{{ selectedTask.status }}</el-descriptions-item><el-descriptions-item label="创建时间">{{ formatTime(selectedTask.created_at) }}</el-descriptions-item><el-descriptions-item label="开始时间">{{ formatTime(selectedTask.started_at) }}</el-descriptions-item><el-descriptions-item label="结束时间">{{ formatTime(selectedTask.finished_at) }}</el-descriptions-item><el-descriptions-item label="当前项数">{{ taskProgress?.total ?? 0 }}</el-descriptions-item></el-descriptions><div class="progress-counts"><el-tag v-for="(count, status) in taskProgress?.status_counts ?? {}" :key="status">{{ status }} {{ count }}</el-tag></div><el-alert v-if="selectedTask.warnings.length" :title="selectedTask.warnings.join('；')" type="warning" :closable="false" /></el-card><el-card class="panel"><template #header>任务事件</template><el-timeline><el-timeline-item v-for="event in taskEvents" :key="event.id" :timestamp="formatTime(event.created_at)" :type="event.level === 'ERROR' ? 'danger' : event.level === 'WARNING' ? 'warning' : 'primary'"><b>{{ event.stage }}</b> · {{ event.message }}</el-timeline-item></el-timeline></el-card><el-card class="panel"><template #header><div class="task-items-header"><span>清单判定完成（{{ taskProgress?.processed ?? 0 }}/{{ taskProgress?.total ?? 0 }}）</span><el-button v-if="taskItems.length > 10" link type="primary" @click="showAllTaskItems = !showAllTaskItems">{{ showAllTaskItems ? '收起详情' : `查看全部 ${taskItems.length} 项` }}</el-button></div></template><p class="table-hint">以下为最近更新记录；人工审核结束后的统一归档会持续更新文件状态，不会改变上方的清单判定完成数。</p><p v-if="taskProgress?.archive" class="table-hint">统一归档（{{ taskProgress.archive.completed }}/{{ taskProgress.archive.total }}）<template v-if="taskProgress.archive.failed"> · 归档失败 {{ taskProgress.archive.failed }}</template></p><el-table :data="visibleTaskItems"><el-table-column prop="filename" label="最近更新文件" /><el-table-column prop="stage" label="阶段" width="180" /><el-table-column prop="status" label="当前状态" width="180" /><el-table-column label="最近更新时间" width="176"><template #default="scope">{{ formatTime(scope.row.updated_at) }}</template></el-table-column><el-table-column prop="error_code" label="错误代码" /></el-table></el-card></template></section>
 
-        <section v-if="activeSection === 'reviews'"><div class="page-heading"><div><h1>人工审核</h1><p>关联候选合并展示；图片对数量仍以红色数字统计。选择保留图后可批量删除其余图片。</p></div><el-button @click="refresh">刷新审核列表</el-button></div><el-empty v-if="!reviewGroups.length" description="当前没有待审核候选组" /><el-card v-for="group in reviewGroups" :key="group.id" class="panel review-card"><template #header>候选审核组 · 任务 #{{ group.task_id }} · {{ group.images.length }} 张图片 · {{ group.relations.length }} 条候选关系</template><el-alert title="这是机器候选关联组，不代表组内图片已被系统判定为全部重复；删除仅按你的选择执行。" type="info" :closable="false" /><div class="comparison review-grid"><figure v-for="image in group.images" :key="image.id"><img :src="`/api/v1/images/${image.id}/preview`" :alt="image.filename" /><figcaption>{{ image.filename }}（{{ image.width }}×{{ image.height }}）<br><el-checkbox v-model="groupKeepIds[group.id]" :label="image.id" :disabled="groupSubmitting[group.id]">保留此图</el-checkbox></figcaption></figure></div><el-descriptions :column="1" size="small" border><el-descriptions-item v-for="relation in group.relations" :key="relation.review_id" label="候选关系">{{ imageLabel(group, relation.new_image_id) }} ↔ {{ imageLabel(group, relation.match_image_id) }} · {{ relation.machine_decision }} · 相似度 {{ relationScore(relation) }} · VLM：{{ relationVlmStatus(relation) }}</el-descriptions-item></el-descriptions><el-checkbox v-model="groupConfirmDeletes[group.id]" :disabled="groupSubmitting[group.id]">我确认永久删除未勾选“保留”的图片，无法恢复高清原图</el-checkbox><div class="actions"><el-button type="danger" :loading="groupSubmitting[group.id]" :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'DELETE_UNSELECTED')">重复，删除未保留图片</el-button><el-button :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'DUPLICATE_KEEP_ALL')">重复，全部保留</el-button><el-button :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'NOT_DUPLICATE_KEEP_ALL')">不是重复，全部保留</el-button><el-button :disabled="groupSubmitting[group.id]" @click="deferGroup">暂不确定</el-button></div></el-card></section>
+        <section v-if="activeSection === 'reviews'">
+          <div class="page-heading">
+            <div><h1>人工审核</h1><p>关联候选合并展示；图片对数量仍以红色数字统计。选择保留图后可批量删除其余图片。</p></div>
+            <div class="review-toolbar">
+              <el-input v-model="reviewSearchQuery" clearable placeholder="搜索图片文件名或任务号" aria-label="搜索图片文件名或任务号" />
+              <el-button @click="refresh">刷新审核列表</el-button>
+            </div>
+          </div>
+          <el-empty v-if="!reviewGroups.length" description="当前没有待审核候选组" />
+          <el-empty v-else-if="!filteredReviewGroups.length" description="未找到匹配的图片或任务" />
+          <el-card v-for="group in filteredReviewGroups" :key="group.id" class="panel review-card">
+            <template #header>候选审核组 · 任务 #{{ group.task_id }} · {{ group.images.length }} 张图片 · {{ group.relations.length }} 条候选关系</template>
+            <el-alert title="这是机器候选关联组，不代表组内图片已被系统判定为全部重复；删除仅按你的选择执行。" type="info" :closable="false" />
+            <div class="comparison review-grid">
+              <figure v-for="image in group.images" :key="image.id">
+                <img :src="`/api/v1/images/${image.id}/preview`" :alt="image.filename" />
+                <figcaption>{{ image.filename }}（{{ image.width }}×{{ image.height }}）<br><el-checkbox v-model="groupKeepIds[group.id]" :label="image.id" :disabled="groupSubmitting[group.id]">保留此图</el-checkbox></figcaption>
+              </figure>
+            </div>
+            <el-descriptions :column="1" size="small" border>
+              <el-descriptions-item v-for="relation in group.relations" :key="relation.review_id" label="候选关系">{{ imageLabel(group, relation.new_image_id) }} ↔ {{ imageLabel(group, relation.match_image_id) }} · {{ relation.machine_decision }} · 相似度 {{ relationScore(relation) }} · VLM：{{ relationVlmStatus(relation) }}</el-descriptions-item>
+            </el-descriptions>
+            <el-checkbox v-model="groupConfirmDeletes[group.id]" :disabled="groupSubmitting[group.id]">我确认永久删除未勾选“保留”的图片，无法恢复高清原图</el-checkbox>
+            <div class="actions">
+              <el-button type="danger" :loading="groupSubmitting[group.id]" :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'DELETE_UNSELECTED')">重复，删除未保留图片</el-button>
+              <el-button :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'DUPLICATE_KEEP_ALL')">重复，全部保留</el-button>
+              <el-button :disabled="groupSubmitting[group.id]" @click="decideGroup(group, 'NOT_DUPLICATE_KEEP_ALL')">不是重复，全部保留</el-button>
+              <el-button :disabled="groupSubmitting[group.id]" @click="deferGroup">暂不确定</el-button>
+            </div>
+          </el-card>
+        </section>
 
         <section v-if="activeSection === 'records'"><div class="page-heading"><div><h1>去重与文件操作记录</h1><p>审计记录与任务日志可按任务查看；此处显示最近记录。</p></div></div><el-card class="panel"><template #header>重复关系</template><el-table :data="duplicateRecords"><el-table-column prop="task_id" label="任务" /><el-table-column prop="pair_type" label="关系" /><el-table-column label="图片对"><template #default="scope">{{ scope.row.new_image?.filename ?? '-' }} ↔ {{ scope.row.match_image?.filename ?? '-' }}</template></el-table-column><el-table-column prop="machine_decision" label="机器判断" /><el-table-column prop="resolution_status" label="处理结果" /><el-table-column label="人工决定"><template #default="scope">{{ scope.row.human_decision?.duplicate ?? '-' }} / {{ scope.row.human_decision?.action ?? '-' }}</template></el-table-column></el-table></el-card><el-card class="panel"><template #header>文件操作</template><el-table :data="operations"><el-table-column prop="task_id" label="任务" /><el-table-column prop="operation" label="操作" /><el-table-column prop="reason" label="原因" /><el-table-column prop="state" label="状态" /><el-table-column prop="error" label="异常" /></el-table></el-card><el-card class="panel"><template #header>VLM 调用审计</template><el-table :data="vlmCalls"><el-table-column prop="task_id" label="任务" /><el-table-column prop="provider" label="Provider" /><el-table-column prop="model" label="模型" /><el-table-column prop="status" label="调用状态" /><el-table-column prop="error_code" label="异常码" /></el-table></el-card></section>
 
-        <section v-if="activeSection === 'health'"><div class="page-heading"><div><h1>服务健康</h1><p>用于确认 API、MySQL、后台 Worker、模型和索引是否处于可工作状态。</p></div><el-button @click="refresh">刷新</el-button></div><el-card class="panel"><el-descriptions :column="3" border><el-descriptions-item label="API">{{ health.api ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="MySQL">{{ health.database ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="Worker">{{ health.worker ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="DINOv2">{{ health.visual ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / 源整图">{{ health.faiss?.SOURCE_FULL ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / 源印花">{{ health.faiss?.SOURCE_PRINT ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / POD">{{ health.faiss?.POD_FULL ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="VLM">{{ health.vlm ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="运行日志">{{ health.runtime_log ?? '检测中' }}（保留 {{ health.log_retention_days ?? 14 }} 天）</el-descriptions-item><el-descriptions-item label="历史源图库目录">{{ health.directories?.source_library ?? '未配置' }}</el-descriptions-item><el-descriptions-item label="POD待处理目录">{{ health.directories?.pod_pending ?? '未配置' }}</el-descriptions-item><el-descriptions-item label="历史POD图库目录">{{ health.directories?.pod_library ?? '未配置' }}</el-descriptions-item></el-descriptions><p v-if="health.worker_last_seen">Worker 最近心跳：{{ formatTime(health.worker_last_seen) }}</p></el-card></section>
+        <section v-if="activeSection === 'health'"><div class="page-heading"><div><h1>服务健康</h1><p>用于确认 API、MySQL、后台 Worker、模型和索引是否处于可工作状态。</p></div><el-button @click="refresh">刷新</el-button></div><el-alert v-if="healthError" title="无法读取 POD 服务健康状态" :description="`${healthError}。请确认本项目 API 正在监听 127.0.0.1:8000，且该端口未被其他项目占用。`" type="error" :closable="false" show-icon /><el-card class="panel"><el-descriptions :column="3" border><el-descriptions-item label="API">{{ healthError ? '不可达' : health.api ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="MySQL">{{ healthError ? '不可用' : health.database ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="Worker">{{ healthError ? '不可用' : health.worker ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="DINOv2">{{ healthError ? '不可用' : health.visual ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / 源整图">{{ healthError ? '不可用' : health.faiss?.SOURCE_FULL ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / 源印花">{{ healthError ? '不可用' : health.faiss?.SOURCE_PRINT ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="FAISS / POD">{{ healthError ? '不可用' : health.faiss?.POD_FULL ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="VLM">{{ healthError ? '不可用' : health.vlm ?? '检测中' }}</el-descriptions-item><el-descriptions-item label="运行日志">{{ healthError ? '不可用' : health.runtime_log ?? '检测中' }}（保留 {{ health.log_retention_days ?? 14 }} 天）</el-descriptions-item><el-descriptions-item label="历史源图库目录">{{ healthError ? '不可用' : health.directories?.source_library ?? '未配置' }}</el-descriptions-item><el-descriptions-item label="POD待处理目录">{{ healthError ? '不可用' : health.directories?.pod_pending ?? '未配置' }}</el-descriptions-item><el-descriptions-item label="历史POD图库目录">{{ healthError ? '不可用' : health.directories?.pod_library ?? '未配置' }}</el-descriptions-item></el-descriptions><p v-if="health.worker_last_seen">Worker 最近心跳：{{ formatTime(health.worker_last_seen) }}</p></el-card></section>
 
         <section v-if="activeSection === 'logs'"><div class="page-heading"><div><h1>运行日志与诊断</h1><p>下载的诊断 JSON 不包含真实路径、图片名或密钥，可直接发给我定位问题。</p></div><div class="actions"><el-button @click="refresh">刷新日志</el-button><el-button type="primary" @click="downloadDiagnostic">下载{{ selectedTask ? `任务 #${selectedTask.task_id} ` : '' }}诊断日志</el-button></div></div><el-card class="panel"><template #header>最近运行日志</template><pre class="runtime-log">{{ runtimeLogs.join('\n') || '尚未写入运行日志。启动 API 或 Worker 后刷新此处。' }}</pre></el-card></section>
 
@@ -302,6 +368,7 @@ onUnmounted(() => { if (refreshTimer) window.clearInterval(refreshTimer); });
 .topbar { display: flex; align-items: center; gap: 28px; height: 58px; padding: 0 24px; background: #fff; border-bottom: 1px solid #e5e7eb; }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 250px; font-size: 17px; font-weight: 650; color: #1b2533; }.brand-mark { display: grid; place-items: center; width: 27px; height: 27px; color: #fff; background: #26824b; border-radius: 7px; }.primary-nav { display: flex; gap: 6px; height: 100%; align-items: center; }.primary-nav .el-button { height: 58px; border-radius: 0; color: #4b5563; }.primary-nav .el-button.active { color: #21713f; border-bottom: 3px solid #2d8a4e; }.top-status { display: flex; gap: 8px; margin-left: auto; }
 .side-nav { min-height: calc(100vh - 58px); padding: 18px 10px; background: #fff; border-right: 1px solid #e5e7eb; }.menu-group p { margin: 8px 12px; color: #9ca3af; font-size: 12px; }.side-nav :deep(.el-menu) { border-right: 0; }.side-nav :deep(.el-menu-item) { height: 42px; line-height: 42px; margin: 3px 0; border-radius: 6px; }.side-nav :deep(.el-menu-item.is-active) { color: #21713f; background: #e9f6ed; }
-.content { padding: 26px 30px 50px; max-width: 1800px; }.page-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 18px; }.page-heading h1 { margin: 0 0 6px; font-size: 22px; }.page-heading p { margin: 0; color: #6b7280; font-size: 14px; }.panel { margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgb(0 0 0 / 5%); }.workflow-panel { max-width: 920px; }.form-grid { padding-top: 12px; }.directory-lock { margin-left: 8px; vertical-align: baseline; }.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }.progress-counts { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }.task-items-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.review-card :deep(.el-card__body) { padding-top: 14px; }.comparison { display: flex; gap: 18px; flex-wrap: wrap; margin: 16px 0; }.comparison figure { width: min(430px, 100%); margin: 0; background: #fafafa; padding: 10px; border: 1px solid #edf0f2; }.review-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); align-items: start; }.review-grid figure { width: auto; }.comparison img { width: 100%; max-height: 440px; object-fit: contain; background: #fff; }.comparison figcaption { margin-top: 8px; overflow-wrap: anywhere; color: #4b5563; }.runtime-log { max-height: 520px; overflow: auto; padding: 16px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; background: #17202d; color: #d9e2ef; border-radius: 6px; font: 12px/1.6 Consolas, monospace; }.settings-form { max-width: 840px; padding: 20px; } .settings-form :deep(.el-checkbox) { display: flex; margin: 14px 0; }
+.content { width: 100%; min-width: 0; padding: 26px 30px 50px; }.page-heading { display: flex; justify-content: space-between; align-items: center; gap: 18px; margin-bottom: 18px; }.page-heading h1 { margin: 0 0 6px; font-size: 22px; }.page-heading p { margin: 0; color: #6b7280; font-size: 14px; }.panel { margin: 16px 0; background: #fff; border-radius: 8px; box-shadow: 0 1px 3px rgb(0 0 0 / 5%); }.workflow-panel { max-width: 920px; }.form-grid { padding-top: 12px; }.directory-lock { margin-left: 8px; vertical-align: baseline; }.actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }.progress-counts { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }.task-items-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.review-card :deep(.el-card__body) { padding-top: 14px; }.comparison { display: flex; gap: 18px; flex-wrap: wrap; margin: 16px 0; }.comparison figure { width: min(430px, 100%); margin: 0; background: #fafafa; padding: 10px; border: 1px solid #edf0f2; }.review-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 12px; align-items: start; }.review-grid figure { width: auto; padding: 8px; }.comparison img { width: 100%; max-height: 440px; object-fit: contain; background: #fff; }.comparison.review-grid img { max-height: 300px; }.comparison figcaption { margin-top: 8px; overflow-wrap: anywhere; color: #4b5563; }.runtime-log { max-height: 520px; overflow: auto; padding: 16px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; background: #17202d; color: #d9e2ef; border-radius: 6px; font: 12px/1.6 Consolas, monospace; }.settings-form { max-width: 840px; padding: 20px; } .settings-form :deep(.el-checkbox) { display: flex; margin: 14px 0; }
+.review-toolbar { display: flex; gap: 10px; width: min(440px, 100%); }.review-toolbar .el-input { flex: 1; }
 @media (max-width: 850px) { .brand { min-width: auto; }.top-status { display: none; }.side-nav { width: 160px !important; }.content { padding: 18px; }.topbar { padding: 0 12px; gap: 8px; } }
 </style>

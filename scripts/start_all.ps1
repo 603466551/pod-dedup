@@ -31,6 +31,34 @@ function Test-ListeningPort([int]$Port) {
     return @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue).Count -gt 0
 }
 
+function Get-PortOwner([int]$Port) {
+    $processIds = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
+    if ($processIds.Count -eq 0) {
+        return $null
+    }
+    if ($processIds.Count -gt 1) {
+        throw "Expected at most one listener on port $Port, found $($processIds.Count)."
+    }
+    return Get-CimInstance Win32_Process -Filter "ProcessId = $($processIds[0])"
+}
+
+function Assert-ExpectedPortOwner([int]$Port, [string]$Name, [string]$CommandSignature) {
+    $process = Get-PortOwner $Port
+    if (-not $process) {
+        return $false
+    }
+    if ($process.CommandLine -notlike $CommandSignature) {
+        throw @"
+Port $Port is occupied by another process, so POD $Name cannot start.
+PID: $($process.ProcessId)
+Process: $($process.Name)
+Command: $($process.CommandLine)
+Stop or reconfigure that application, then rerun this script. This script will not stop a process that is not part of POD 图片去重与归档管理系统.
+"@
+    }
+    return $true
+}
+
 function Test-WorkerRunning {
     return (Get-ProjectWorkerRoots).Count -gt 0
 }
@@ -55,16 +83,12 @@ function Stop-ProjectWorkerTree([int]$ProcessId) {
 }
 
 function Stop-ListeningPort([int]$Port, [string]$Name, [string]$CommandSignature) {
-    $processIds = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
-    if ($processIds.Count -gt 1) {
-        throw "Expected at most one $Name listener on port $Port, found $($processIds.Count)."
-    }
-    if ($processIds.Count -eq 1) {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId = $($processIds[0])"
-        if (-not $process -or $process.CommandLine -notlike $CommandSignature) {
-            throw "Port $Port is not owned by the expected POD $Name process; refusing to stop it."
+    $process = Get-PortOwner $Port
+    if ($process) {
+        if ($process.CommandLine -notlike $CommandSignature) {
+            throw "Port $Port is occupied by PID $($process.ProcessId) ($($process.CommandLine)); refusing to stop a non-POD $Name process."
         }
-        Stop-Process -Id $processIds[0] -Force
+        Stop-Process -Id $process.ProcessId -Force
         Write-Host "$Name stopped for restart."
     }
 }
@@ -101,6 +125,18 @@ function Wait-ForStartup([string]$Name, [scriptblock]$Ready) {
     return $false
 }
 
+if ($Restart) {
+    Stop-ListeningPort 8000 'API' '*uvicorn*app.main:app*'
+    Stop-ProjectWorker
+    Stop-ListeningPort 5173 'Frontend' '*vite*--host*127.0.0.1*'
+    Start-Sleep -Milliseconds 500
+} else {
+    # Fail before starting MySQL, installing dependencies, or opening any
+    # project windows when another application already owns a required port.
+    [void](Assert-ExpectedPortOwner 8000 'API' '*uvicorn*app.main:app*')
+    [void](Assert-ExpectedPortOwner 5173 'Frontend' '*vite*--host*127.0.0.1*')
+}
+
 $mysql = Get-Service -Name 'MySQL57' -ErrorAction SilentlyContinue
 if (-not $mysql) {
     throw 'MySQL57 Windows service was not found. Install/configure MySQL 5.7.40 or update the script with the actual service name.'
@@ -130,14 +166,7 @@ if (-not (Test-Path (Join-Path $frontend 'node_modules'))) {
     }
 }
 
-if ($Restart) {
-    Stop-ListeningPort 8000 'API' '*uvicorn*app.main:app*'
-    Stop-ProjectWorker
-    Stop-ListeningPort 5173 'Frontend' '*vite*--host*127.0.0.1*'
-    Start-Sleep -Milliseconds 500
-}
-
-if (Test-ListeningPort 8000) {
+if (Assert-ExpectedPortOwner 8000 'API' '*uvicorn*app.main:app*') {
     Write-Host 'API is already listening on http://127.0.0.1:8000.' -ForegroundColor Green
 } else {
     Start-ProjectProcess 'API' 'start_api.ps1'
@@ -147,7 +176,7 @@ if (Test-WorkerRunning) {
 } else {
     Start-ProjectProcess 'Worker' 'start_worker.ps1'
 }
-if (Test-ListeningPort 5173) {
+if (Assert-ExpectedPortOwner 5173 'Frontend' '*vite*--host*127.0.0.1*') {
     Write-Host 'Frontend is already listening on http://127.0.0.1:5173.' -ForegroundColor Green
 } else {
     Start-ProjectProcess 'Frontend' 'start_frontend.ps1'
